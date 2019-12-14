@@ -1,0 +1,775 @@
+#!/bin/sh
+# Quick (and shallow) Maven POM file inspector command.
+# Print info in compact and readable plain text format.
+# Requires:
+#   xsltproc and /bin/sh (plain Bourne shell is sufficient).
+#
+################################################################################
+#               Author: Øyvind Stegard <oyvind@stegard.net>
+#       Copyright (C) 2012-2019 Øyvind Stegard <oyvind@stegard.net>
+#
+#                                   LICENSE
+# This program is free software: you can redistribute it and/or modify it under 
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+################################################################################
+#
+# TODO Consider adding support for colored output (simple to do, might get
+#      better readability)
+#
+#
+# Changelog
+# 0.7
+#   * Add support for displaying modules and multi-project effective POMs.
+#
+# 0.6.1
+#   * Simplify specifying a different POM file rather than looking in current
+#     directory. (The "-f"/"--file" option is removed. Just specify dir or file
+#     directly.)
+#
+# 0.6
+#   * When selecting a profile, don't hide global data common to all profiles.
+#     Show profile-specific data appended to global data.
+#   * Support display of generated effective POM (requires invocation of Maven).
+#   * Support resolving complete dependency list (requires invocation of Maven).
+#   * Fix display of transitive exclusions per dependency.
+#   * Show parent POM artifact info as part of basic metadata if present.
+#
+# 0.5.2
+#   * Show contents of <snapshotRepository> as well, for distribution
+#     management.
+#
+# 0.5.1
+#   * Better option parsing.
+#
+# 0.5
+#   * Added support for displaying properties.
+#   * Added support for displaying data in separate POM profiles.
+
+readonly VER=0.7
+
+xml_pom_values() {
+    local pomfile xpath
+    pomfile="$1" xpath="$2"
+    [ "$xpath" = / ] && return 1
+    local elem
+    elem=${xpath##*/}
+    elem=${elem%%\[*\]}
+    [ "$elem" ] || elem='.'
+
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/"><apply-templates select="${xpath}"/></template>
+  <template match="${elem}">
+    <value-of select="normalize-space(.)"/>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+# Count number of project nodes in XML (may be > 1 if effective-pom for multi-module)
+xml_count_projects() {
+    local pomfile="$1"
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <value-of select="count(//mvn:project)"/>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+# In case of multiple project nodes from effective-pom, split into multiple XML files
+xml_split_projects() {
+    local pomfile="$1"
+    local count=$(xml_count_projects "$pomfile")
+    if [ -z "$count" ] || [ "$count" -le 1 ]; then
+        echo "$pomfile"
+    fi
+    local n tmpfile
+    for n in $(seq 1 $count); do
+        tmpfile=$(mktemp -t effective-pom.XXXXXX.xml)
+        xsltproc -o "$tmpfile" - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="xml" version="1.0" encoding="UTF-8"/>
+  <template match="/">
+    <copy-of select="/projects/mvn:project[${n}]" />
+  </template>
+</stylesheet>
+EOF
+        echo "$tmpfile"
+    done
+}
+
+xml_pom_deps() {
+    local pomfile="$1" profile="$2" predicate="$3" noversion="$4"
+
+    local v_xsl=
+    [ "$noversion" ] || v_xsl="<if test=\"mvn:version\"><value-of select=\"concat(':', normalize-space(mvn:version))\"/></if>"
+    local select_xpath="/mvn:project${profile:+/mvn:profiles/mvn:profile[mvn:id='$profile']}/mvn:dependencies/mvn:dependency${predicate:+[$predicate]}"
+    
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <apply-templates select="${select_xpath}"/>
+  </template>
+  <template match="mvn:dependency">
+    <if test="mvn:groupId"><value-of select="concat(normalize-space(mvn:groupId), ':')"/></if>
+    <value-of select="normalize-space(mvn:artifactId)"/>
+    ${v_xsl}
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+xml_pom_parent_dep() {
+    local pomfile="$1"
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <apply-templates select="/mvn:project/mvn:parent"/>
+  </template>
+  <template match="mvn:parent">
+    <if test="mvn:groupId"><value-of select="concat(normalize-space(mvn:groupId), ':')"/></if>
+    <value-of select="normalize-space(mvn:artifactId)"/>
+    <if test="mvn:version"><value-of select="concat(':', normalize-space(mvn:version))"/></if>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+xml_pom_props() {
+    local pomfile="$1" profile="$2" predicate="$3"
+    
+    local select_xpath="/mvn:project${profile:+/mvn:profiles/mvn:profile[mvn:id='$profile']}/mvn:properties${predicate:+[$predicate]}"
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <apply-templates select="${select_xpath}"/>
+  </template>
+  <template match="mvn:properties">
+    <for-each select="*">
+      <value-of select="normalize-space(local-name(.))" /><text>&#32;=&#32;</text><value-of select="normalize-space(.)" /><text>&#10;</text>
+    </for-each>
+  </template>
+</stylesheet>
+EOF
+}
+
+xml_pom_get_dep_exclusions() {
+    local pomfile="$1" profile="$2" predicate="$3"
+
+    local select_xpath="/mvn:project${profile:+/mvn:profiles/mvn:profile[mvn:id='$profile']}/mvn:dependencies/mvn:dependency${predicate:+[$predicate]}"
+    
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <apply-templates select="${select_xpath}"/>
+  </template>
+  <template match="mvn:dependency">
+    <if test="mvn:exclusions">
+      <apply-templates select="mvn:exclusions/mvn:exclusion" />
+    </if>
+  </template>
+  <template match="mvn:exclusion">
+    <if test="mvn:groupId"><value-of select="concat(normalize-space(mvn:groupId), ':')"/></if>
+    <value-of select="normalize-space(mvn:artifactId)"/>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+xml_pom_get_build_plugins() {
+    local pomfile="$1" profile="$2" predicate="$3"
+    local select_xpath="/mvn:project${profile:+/mvn:profiles/mvn:profile[mvn:id='$profile']}/mvn:build/mvn:plugins/mvn:plugin${predicate:+[$predicate]}"
+
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <apply-templates select="${select_xpath}"/>
+  </template>
+  <template match="mvn:plugin">
+    <if test="mvn:groupId"><value-of select="concat(normalize-space(mvn:groupId), ':')"/></if>
+    <value-of select="normalize-space(mvn:artifactId)"/>
+    <if test="mvn:version"><value-of select="concat(':', normalize-space(mvn:version))"/></if>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+xml_pom_get_modules() {
+    local pomfile="$1" profile="$2" predicate="$3"
+    local select_xpath="/mvn:project${profile:+/mvn:profiles/mvn:profile[mvn:id='$profile']}/mvn:modules/mvn:module${predicate:+[$predicate]}"
+
+    xsltproc - "$pomfile" 2>/dev/null <<EOF
+<?xml version="1.0"?>
+<stylesheet version="1.0"
+  xmlns="http://www.w3.org/1999/XSL/Transform"
+  xmlns:mvn="http://maven.apache.org/POM/4.0.0">
+  <output method="text" encoding="UTF-8"/>
+  <template match="/">
+    <apply-templates select="${select_xpath}"/>
+  </template>
+  <template match="mvn:module">
+    <value-of select="normalize-space(.)"/>
+    <text>&#10;</text>
+  </template>
+</stylesheet>
+EOF
+}
+
+get_abs_path() {
+    local oldpwd dir name
+    oldpwd=`pwd`
+    dir=`dirname "$1"`
+    name=`basename "$1"`
+    cd "$dir" 2>/dev/null || return 1
+    dir=`pwd`
+    cd "$oldpwd"
+    [ "$dir" != / ] && echo "$dir/$name" || echo "/$name"
+}
+
+get_parent_pom_file_ref() {
+    local parentpom_file
+    parentpom_file=`xml_pom_values "$1" /mvn:project/mvn:parent/mvn:relativePath 2>/dev/null`
+    [ "$parentpom_file" ] && echo $parentpom_file || return 1
+}
+
+get_parent_pom_file_ref_abs_path() {
+    local pomfile_abs parent_ref oldpwd pomfile_dir refdir name dir parent_abs
+    pomfile_abs="$1"
+    parent_ref="$2"
+    if [ "$pomfile_abs" ] && [ "$parent_ref" ]; then
+        # Resolve parent reference and check for existence
+        oldpwd=`pwd`
+        pomfile_dir=`dirname "$pomfile_abs"`
+        cd "$pomfile_dir"
+        if [ -f "$parent_ref" ]; then
+            refdir=`dirname "$parent_ref"`
+            cd "$refdir"
+            name=`basename "$parent_ref"`
+            dir=`pwd`
+            parent_abs="$dir/$name"
+        else
+            return 1
+        fi
+        cd "$oldpwd"
+    fi
+    [ "$parent_abs" ] && echo "$parent_abs" || return 1
+}
+
+# Echoes name of temporary file which contains effective POM
+mvn_generate_effective_pom() {
+    local pomfile="$1" profile="$2" tmpfile
+    type mvn 1>/dev/null 2>&1 || { echo "Error: generating effective POM requires mvn command in PATH"; exit 1; }
+    tmpfile=$(mktemp -t effective-pom.XXXXXX.xml) || { echo "Error: failed to create temporary file"; exit 1; }
+    mvn -q -B -f "$pomfile" ${profile:+-P$profile} -Doutput="$tmpfile" help:effective-pom 1>&2
+    if [ $? -eq 0 ]; then
+        echo "$tmpfile"
+    else
+        rm -f "$tmpfile"
+        return 1
+    fi
+}
+
+# Echoes list of all dependencies transitively resolved
+mvn_resolve_dependencies() {
+    local pomfile="$1" profile="$2" tmpfile exitcode
+    type mvn 1>/dev/null 2>&1 || { echo "Error: resolving dependencies requires mvn command in PATH"; exit 1; }
+    tmpfile=`mktemp -t resolved-dependency-list.XXXXXX` || { echo "Error: failed to create temporary file"; exit 1; }
+    mvn -q -B -f "$pomfile" ${profile:+-P$profile} -DoutputFile="$tmpfile" -Dsilent=true dependency:list
+    exitcode=$?
+    if [ $exitcode -eq 0 ]; then
+        awk -F: '/(compile|provided|runtime|test|system)$/ {gsub(/[ \t]/,"");printf("%s:%s:%s\n",$1,$2,$4);}' < "$tmpfile" | LC_ALL=C sort
+    fi
+    rm -f "$tmpfile"
+    [ $exitcode -eq 0 ]
+}
+
+show_basic_metadata() {
+    local pomfile version name artifactId groupId parent_ref parent_dep profiles packaging
+    pomfile="$1"
+    version=`xml_pom_values "$pomfile" /mvn:project/mvn:version 2>/dev/null`
+    profiles=`xml_pom_values "$pomfile" /mvn:project/mvn:profiles/mvn:profile/mvn:id 2>/dev/null`
+    name=`xml_pom_values "$pomfile" /mvn:project/mvn:name 2>/dev/null`
+    artifactId=`xml_pom_values "$pomfile" /mvn:project/mvn:artifactId 2>/dev/null`
+    groupId=`xml_pom_values "$pomfile" /mvn:project/mvn:groupId 2>/dev/null`
+    parent_ref=`get_parent_pom_file_ref "$pomfile"`
+    parent_dep=`xml_pom_parent_dep "$pomfile"`
+
+    [ "$name" ]        && echo "Name             $name"
+    [ "$groupId" ]     && echo "GroupId          $groupId"
+    [ "$artifactId" ]  && echo "ArtifactId       $artifactId"
+    [ "$version" ]     && echo "Version          $version"
+    if [ "$profiles" ]; then
+        local profiles_string profile
+        for profile in $profiles; do
+            [ "$profiles_string" ] && profiles_string="$profiles_string, $profile" || profiles_string="$profile"
+        done
+        echo "Profiles         $profiles_string"
+    fi
+    [ "$parent_dep" ] && echo "Parent POM       $parent_dep"
+    [ "$parent_ref" ] && echo "Parent POM path  $parent_ref"
+
+    echo
+}
+
+show_pom_transitive_exclusions() {
+    local pomfile="$1" have_excl= have_excl_profile=
+
+    have_excl=`xml_pom_values "$pomfile" "/mvn:project/mvn:dependencies/mvn:dependency[mvn:exclusions]"`
+    [ "$PROFILE" ] && have_excl_profile=`xml_pom_values "$pomfile" "/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:dependencies/mvn:dependency[mvn:exclusions]"`
+    if [ "$have_excl" ] || [ "$have_excl_profile" ]; then
+        echo "Exclusions of transitive dependencies:"
+    else
+        return 1
+    fi
+    
+    local dep groupId artifactId predicate
+    for dep in `xml_pom_deps "$pomfile" "" mvn:exclusions noversion`; do
+        groupId=${dep%:*}
+        artifactId=${dep#*:}
+        if [ "$artifactId" = "$dep" ]; then
+            predicate="mvn:artifactId = '$artifactId'"
+        else
+            predicate="mvn:artifactId = '$artifactId' and mvn:groupId = '$groupId'"
+        fi
+
+        echo "  Excluded for $dep:"
+        list_elements "    " `xml_pom_get_dep_exclusions "$pomfile" "" "$predicate"`
+        echo
+    done
+    if [ "$have_excl_profile" ]; then
+        for dep in `xml_pom_deps "$pomfile" "$PROFILE" mvn:exclusions noversion`; do
+            groupId=${dep%:*}
+            artifactId=${dep#*:}
+            if [ "$artifactId" = "$dep" ]; then
+                predicate="mvn:artifactId = '$artifactId'"
+            else
+                predicate="mvn:artifactId = '$artifactId' and mvn:groupId = '$groupId'"
+            fi
+
+            echo "  Excluded for $dep:"
+            list_elements "    " `xml_pom_get_dep_exclusions "$pomfile" "$PROFILE" "$predicate"`
+            echo
+        done
+    fi
+}
+
+# List elements, possibly in two columns.
+# Order is properly presented in two-column mode.
+# First parameter is the prefix.
+# The rest of the parameters are the elements to list.
+list_elements() {
+    local prefix="$1"
+    shift
+    local elemcount=0 elem maxcol=0
+    for elem in "$@"; do elemcount=$((elemcount+1)); [ ${#elem} -gt $maxcol ] && maxcol=${#elem}; done
+    [ $elemcount -eq 0 ] && return 1
+    local half=$((elemcount/2))
+    local count=0 colwidth=0
+    [ $((elemcount % 2)) -eq 0 ] && count=1
+    local elems_col1 elems_col2
+    for elem in "$@"; do
+        if [ $count -le $half ]; then
+            elems_col1="$elems_col1${IFS}$elem"
+            [ ${#elem} -gt $colwidth ] && colwidth=${#elem}
+        else
+            elems_col2="$elems_col2${IFS}$elem"
+        fi
+        count=$((count+1))
+    done
+    colwidth=$((colwidth+1))
+
+    # Check terminal width.
+    # If two colums is too wide or too few elements, fall-back to single-column output.
+    local single tw
+    tw=`tput cols`
+    single=
+    if [ $? -ne 0 ] || [ -z "$tw" ] || [ $((colwidth + maxcol + 3)) -gt $tw ] || \
+       [ $elemcount -le 6 ] || [ "$always_single" ]; then
+        single=1
+    fi
+    
+    if [ "$single" ]; then
+        # Single column listing
+        for elem in "$@"; do
+            printf "%s%s\n" "$prefix" "$elem"
+        done
+    else
+        # Two-column listing in proper order. This gets kinda quirky because plain Bourne-shell
+        # does not support arrays. So we work around that ..
+        local col1 col2 c1 c2
+        c1=1
+        for elem in $elems_col1; do
+            col1="$elem"
+            col2=
+            c2=1
+            for elem2 in $elems_col2; do [ $c1 -eq $c2 ] && col2="$elem2" && break; c2=$((c2+1)); done
+            printf "%s%-${colwidth}s %s\n" "$prefix" "$col1" "$col2"
+            c1=$((c1+1))
+        done
+    fi
+}
+
+show_pom_distribution_management_repository() {
+    local pomfile="$1" repourls repourls_profile=
+    repourls=`xml_pom_values "$pomfile" "/mvn:project/mvn:distributionManagement/mvn:repository/mvn:url|/mvn:project/mvn:distributionManagement/mvn:snapshotRepository/mvn:url"`
+    [ "$PROFILE" ] && repourls_profile=`xml_pom_values "$pomfile" "/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:distributionManagement/mvn:repository/mvn:url|/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:distributionManagement/mvn:snapshotRepository/mvn:url"`
+    
+    if [ "$repourls" ] || [ "$repourls_profile" ]; then
+        local repourl
+        echo "Distribution repository URLs:"
+        for repourl in $repourls $repourls_profile; do
+            echo "  $repourl"
+        done
+        echo
+    fi
+}
+
+list_pom_repositories() {
+    local pomfile="$1" repos= plugin_repos= repos_profile= plugin_repos_profile=
+
+    repos=`xml_pom_values "$pomfile" /mvn:project/mvn:repositories/mvn:repository/mvn:url | LC_ALL=C sort`
+    plugin_repos=`xml_pom_values "$pomfile" /mvn:project/mvn:pluginRepositories/mvn:pluginRepository/mvn:url | LC_ALL=C sort`
+    [ "$PROFILE" ] && repos_profile=`xml_pom_values "$pomfile" "/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:repositories/mvn:repository/mvn:url" | LC_ALL=C sort`
+    [ "$PROFILE" ] && plugin_repos_profile=`xml_pom_values "$pomfile" "/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:pluginRepositories/mvn:pluginRepository/mvn:url" | LC_ALL=C sort`
+
+    if [ "$repos" ] || [ "$plugin_repos" ] || [ "$repos_profile" ] || [ "$plugin_repos_profile" ]; then
+        echo "Defined repository URLs:"
+    fi
+
+    if [ "$repos" ] || [ "$repos_profile" ]; then
+        for url in $repos $repos_profile; do
+            echo "  $url"
+        done
+    fi
+    if [ "$plugin_repos" ] || [ "$plugin_repos_profile" ]; then
+        for url in $plugin_repos $plugin_repos_profile; do
+            echo "  $url  (Plugins)"
+        done
+    fi
+    if [ "$repos" ] || [ "$plugin_repos" ] || [ "$repos_profile" ] || [ "$plugin_repos_profile" ]; then
+        echo
+    fi
+}
+
+display_pom_data() {
+    local pomfile="$1" pomfile_abs
+    pomfile_abs=`get_abs_path "$pomfile"`
+    [ "${pomfile_abs#$HOME}" != "$pomfile_abs" ] && pomfile_abs="~${pomfile_abs#$HOME}"
+
+    if [ "$2" = "parent" ]; then
+        echo "Parent POM file  $pomfile_abs"
+    else
+        echo "POM file         $pomfile_abs"
+    fi
+
+    [ -z "$show_all" ] && [ -z "$short_basic" ] && echo
+
+    { [ "$show_all" ] || [ "$short_basic" ]; } && show_basic_metadata "$pomfile"
+    { [ "$show_all" ] || [ "$short_dist" ]; } && show_pom_distribution_management_repository "$pomfile"
+    { [ "$show_all" ] || [ "$short_repos" ]; } && list_pom_repositories "$pomfile"
+
+    if [ "$show_all" ] || [ "$short_modules" ]; then
+        local modules modules_profile=
+        modules=`xml_pom_get_modules "$pomfile"|LC_ALL=C sort`
+        [ "$PROFILE" ] && modules_profile=`xml_pom_get_modules "$pomfile" "$PROFILE"|LC_ALL=C sort`
+        if [ "$modules" ] || [ "$modules_profile" ]; then
+            echo "Modules:"
+            list_elements "  " $modules $modules_profile
+            echo
+        fi
+    fi
+
+    if [ "$show_all" ] || [ "$short_plugs" ]; then
+        local build_plugins build_plugins_profile=
+        build_plugins=`xml_pom_get_build_plugins "$pomfile"|LC_ALL=C sort`
+        [ "$PROFILE" ] && build_plugins_profile=`xml_pom_get_build_plugins "$pomfile" "$PROFILE"|LC_ALL=C sort`
+        if [ "$build_plugins" ] || [ "$build_plugins_profile" ]; then
+            echo "Build plugins:"
+            list_elements "  " $build_plugins $build_plugins_profile
+            echo
+        fi
+    fi
+
+    if [ "$show_all" ] || [ "$short_props" ]; then
+        local props props_profile=
+        props=`xml_pom_props "$pomfile"|LC_ALL=C sort`
+        [ "$PROFILE" ] && props_profile=`xml_pom_props "$pomfile" "$PROFILE"|LC_ALL=C sort`
+        if [ "$props" ] || [ "$props_profile" ]; then
+            echo "Properties:"
+            IFS='
+'
+            list_elements "  " $props $props_profile
+            echo
+            IFS='
+	 '
+        fi
+    fi
+
+    if [ "$show_all" ] || [ "$short_deps" ]; then
+        if [ "$RESOLVED_DEPS" ]; then
+            echo "All resolved dependencies:"
+            list_elements "  " $RESOLVED_DEPS
+            echo
+        else
+            local pom_deps pom_deps_profile=
+            pom_deps=`xml_pom_deps "$pomfile"|LC_ALL=C sort`
+            [ "$PROFILE" ] && pom_deps_profile=`xml_pom_deps "$pomfile" "$PROFILE"|LC_ALL=C sort`
+            if [ "$pom_deps" ] || [ "$pom_deps_profile" ]; then
+                echo "Direct dependencies:"
+                list_elements "  " $pom_deps $pom_deps_profile
+                echo
+            fi
+        fi
+    fi
+
+    { [ "$show_all" ] || [ "$short_trex" ]; } && show_pom_transitive_exclusions "$pomfile"
+}
+
+usage() {
+    cat <<EOF
+Maven POM file inspector $VER
+This command quickly extracts and displays essential data from a Maven POM file.
+The output is compact and readable plain text.
+
+Usage: `basename $0` [options] [pomfile/dir] [shortcut [..]]
+
+By default, the first POM file found in either the current directory
+or any parent directory is processed, and all information is displayed. If path
+to an existing directory or file is supplied, then that is used as basis for POM
+file resolving instead.
+
+If the POM file directly refers to a parent POM by path, the parent POM is also
+processed and displayed.
+
+Shortcuts can be used to filter the types of information displayed about the POM
+file.
+
+Options:
+-1, --single       Always use single-column listings.
+-P, --profile <id> Show data for given POM profile.
+                   This will not show global data common to all profiles.
+-E, --effective    Invoke Maven to generate effective POM and display that instead.
+-R, --resolve      Invoke Maven to resolve all regular dependencies before display.
+-N, --noparents    Avoid traversing parent POM files with local path reference.
+-v, --version      Show version of this utility.
+-h, --help         Show this help.
+
+Shortcuts/filters:
+ba[sic]        Show basic project info.
+re[pos]        Show defined repositories.
+di[st]         Show distribution repository.
+pl[ugins]      Show build plugins.
+de[ps]         Show direct dependencies.
+ex[clusions]   Show transitive exclusions for direct dependencies.
+pr[ops]        Show properties.
+all            Show everything (DEFAULT).
+EOF
+    exit 0
+}
+
+pomfile=
+show_all=1
+short_dist=
+short_basic=
+short_repos=
+short_plugs=
+short_deps=
+short_trex=
+short_props=
+short_modules=
+always_single=
+profile=
+effective_pom=
+resolve_deps=
+follow_parent_poms=1
+while [ "$1" ]; do
+    if [ -f "$1" ] || [ -d "$1" ]; then
+        pomfile="$1"; shift; continue
+    fi
+    
+    case "$1" in
+        -h|--help|-\?|-H) usage ;;
+        -v|--version) echo "pom v$VER"; exit 0 ;;
+        -1|--single) always_single=1 ;;
+        -E|--effective)
+            effective_pom=1
+            ;;
+        -N|--noparents)
+            follow_parent_poms=
+            ;;
+        -R|--resolve)
+            resolve_deps=1
+            ;;
+            
+        -P*|--profile)
+            if [ "$1" != "--profile" ] && [ "${1#-P}" ]; then
+                profile="${1#-P}"
+            else
+                shift
+                profile="$1"
+            fi
+            if [ "${profile#*,}" != "$profile" ] || [ "${profile%,*}" != "$profile" ]; then
+                echo "Error: can only show info for a single profile at a time: $profile"
+                exit 1
+            fi
+            ;;
+        
+        ba*) short_basic=1; show_all= ;;
+        re*) short_repos=1; show_all= ;;
+        di*) short_dist=1; show_all=  ;;
+        pl*) short_plugs=1; show_all= ;;
+        de*) short_deps=1; show_all=  ;;
+        ex*) short_trex=1; show_all=  ;;
+        pr*) short_props=1; show_all= ;;
+        mo*) short_modules=1; show_all= ;;
+        all) show_all=1 ;;
+        
+        *)
+            echo "Error: unknown option/shortcut or non-existing file/dir: $1, see --help."; exit 1 ;;
+    esac
+    shift
+done
+
+type xsltproc 1>/dev/null 2>&1 || { echo "Error: missing required command: xsltproc"; exit 255; }
+
+# Resolve actual pom.xml file to work with:
+if [ -z "$pomfile" ] || [ -d "$pomfile" ]; then
+    if [ -d "$pomfile" ]; then
+        oldpwd=`pwd`
+        cd "$pomfile"
+        dir=`pwd`
+        cd "$oldpwd"
+    else
+        dir=`pwd`
+    fi
+    
+    until [ -f "$dir/pom.xml" ] || [ "$dir" = / ]; do dir=`dirname "$dir"`; done
+    pomfile="$dir/pom.xml"
+
+    if ! [ -f "$pomfile" ]; then
+        echo "Error: no pom.xml file found in base or any parent directory."
+        exit 1
+    fi
+elif ! [ -f "$pomfile" ]; then
+    echo "Error: POM file $pomfile not found."
+    exit 1
+fi
+
+PROFILE=
+if [ "$profile" ]; then
+    found=
+    for p in $(xml_pom_values "$pomfile" /mvn:project/mvn:profiles/mvn:profile/mvn:id 2>/dev/null); do
+        if [ "$p" = "$profile" ]; then
+            found=1
+            break
+        fi
+    done
+
+    if [ -z "$found" ]; then
+        echo "Error: profile with id '$profile' not found in POM file"
+        exit 1
+    fi
+
+    PROFILE=$profile
+fi
+
+RESOLVED_DEPS=
+if [ "$resolve_deps" ]; then
+    echo "Invoking Maven to resolve dependencies .." >&2
+    RESOLVED_DEPS=$(mvn_resolve_dependencies "$pomfile" "$PROFILE")
+    if [ $? -ne 0 ]; then
+        echo "Error: Maven failed to resolve dependencies for file $pomfile"
+        exit 1
+    fi
+fi
+    
+
+if [ "$effective_pom" ]; then
+    echo "Invoking Maven to generate effective POM .." >&2
+    tmp_pomfile=$(mvn_generate_effective_pom "$pomfile" "$PROFILE")
+    if [ $? -ne 0 ]; then
+        echo "Error: Maven failed to generate effective POM for file $pomfile"
+        exit 1
+    fi
+    PROFILE= # selected profile is factored into global POM parts by Maven.
+
+    # Effective POM file may contain multiple projects, split into several files
+    for tmp_project_pomfile in $(xml_split_projects "$tmp_pomfile"); do
+        echo ------------------------
+        echo
+        display_pom_data "$tmp_project_pomfile"
+        rm -f "$tmp_project_pomfile"
+    done
+    rm -f "$tmp_pomfile"
+else
+    parent=
+    while [ "$pomfile" ]; do
+        display_pom_data "$pomfile" $parent
+        
+        parent_ref=`get_parent_pom_file_ref "$pomfile"`
+        pomfile_abs=`get_abs_path "$pomfile"`
+        if [ "$parent_ref" ] && [ "$follow_parent_poms" ]; then
+            parent_abs=`get_parent_pom_file_ref_abs_path "$pomfile_abs" "$parent_ref"`
+            if [ $? -eq 0 ]; then
+                echo
+                pomfile="$parent_abs"
+                parent=parent
+                continue
+            else
+                echo "Warning: invalid parent POM reference detected: '$parent_ref' (not found)."
+            fi
+        fi
+        pomfile=
+    done
+fi
+
+exit 0
