@@ -1,8 +1,9 @@
 #!/bin/sh
-# Quick (and shallow) Maven POM file inspector command.
+# Inspector Pom; quick (and shallow) Maven POM file inspector command.
 # Print info in compact and readable plain text format.
+#
 # Requires:
-#   xsltproc and /bin/sh (plain Bourne shell is sufficient).
+#   xsltproc and a typical UNIX shell environment
 #
 ################################################################################
 #               Author: Øyvind Stegard <oyvind@stegard.net>
@@ -23,13 +24,11 @@
 #
 ################################################################################
 #
-# TODO Consider adding support for colored output (simple to do, might get
-#      better readability)
-#
-#
-# Changelog
-# 0.7
+#                                  Changelog
+# 0.9
 #   * Add support for displaying modules and multi-project effective POMs.
+#   * Add support for experimental colorization of output, specifically artifacts.
+#   * Some internal rewrites.
 #
 # 0.6.1
 #   * Simplify specifying a different POM file rather than looking in current
@@ -54,8 +53,10 @@
 # 0.5
 #   * Added support for displaying properties.
 #   * Added support for displaying data in separate POM profiles.
+#
+################################################################################
 
-readonly VER=0.7
+readonly VER=0.9
 
 xml_pom_values() {
     local pomfile xpath
@@ -101,13 +102,14 @@ EOF
 # In case of multiple project nodes from effective-pom, split into multiple XML files
 xml_split_projects() {
     local pomfile="$1"
-    local count=$(xml_count_projects "$pomfile")
+    local count=`xml_count_projects "$pomfile"`
     if [ -z "$count" ] || [ "$count" -le 1 ]; then
         echo "$pomfile"
+        return 0
     fi
     local n tmpfile
-    for n in $(seq 1 $count); do
-        tmpfile=$(mktemp -t effective-pom.XXXXXX.xml)
+    for n in `seq 1 $count`; do
+        tmpfile=`mktemp -t effective-pom.XXXXXX.xml`
         xsltproc -o "$tmpfile" - "$pomfile" 2>/dev/null <<EOF
 <?xml version="1.0"?>
 <stylesheet version="1.0"
@@ -307,8 +309,8 @@ get_parent_pom_file_ref_abs_path() {
 # Echoes name of temporary file which contains effective POM
 mvn_generate_effective_pom() {
     local pomfile="$1" profile="$2" tmpfile
-    type mvn 1>/dev/null 2>&1 || { echo "Error: generating effective POM requires mvn command in PATH"; exit 1; }
-    tmpfile=$(mktemp -t effective-pom.XXXXXX.xml) || { echo "Error: failed to create temporary file"; exit 1; }
+    type mvn 1>/dev/null 2>&1 || { echo >&2 "Error: generating effective POM requires mvn command in PATH"; exit 1; }
+    tmpfile=`mktemp -t effective-pom.XXXXXX.xml` || { echo >&2 "Error: failed to create temporary file"; exit 1; }
     mvn -q -B -f "$pomfile" ${profile:+-P$profile} -Doutput="$tmpfile" help:effective-pom 1>&2
     if [ $? -eq 0 ]; then
         echo "$tmpfile"
@@ -321,12 +323,12 @@ mvn_generate_effective_pom() {
 # Echoes list of all dependencies transitively resolved
 mvn_resolve_dependencies() {
     local pomfile="$1" profile="$2" tmpfile exitcode
-    type mvn 1>/dev/null 2>&1 || { echo "Error: resolving dependencies requires mvn command in PATH"; exit 1; }
-    tmpfile=`mktemp -t resolved-dependency-list.XXXXXX` || { echo "Error: failed to create temporary file"; exit 1; }
+    type mvn 1>/dev/null 2>&1 || { echo >&2 "Error: resolving dependencies requires mvn command in PATH"; exit 1; }
+    tmpfile=`mktemp -t resolved-dependency-list.XXXXXX` || { echo >&2 "Error: failed to create temporary file"; exit 1; }
     mvn -q -B -f "$pomfile" ${profile:+-P$profile} -DoutputFile="$tmpfile" -Dsilent=true dependency:list
     exitcode=$?
     if [ $exitcode -eq 0 ]; then
-        awk -F: '/(compile|provided|runtime|test|system)$/ {gsub(/[ \t]/,"");printf("%s:%s:%s\n",$1,$2,$4);}' < "$tmpfile" | LC_ALL=C sort
+        awk -F: '/:(compile|provided|runtime|test|system)$/ {gsub(/[ \t]/,"");printf("%s:%s:%s:%s\n",$1,$2,$4,$5);}' < "$tmpfile" | LC_ALL=C sort
     fi
     rm -f "$tmpfile"
     [ $exitcode -eq 0 ]
@@ -340,22 +342,24 @@ show_basic_metadata() {
     name=`xml_pom_values "$pomfile" /mvn:project/mvn:name 2>/dev/null`
     artifactId=`xml_pom_values "$pomfile" /mvn:project/mvn:artifactId 2>/dev/null`
     groupId=`xml_pom_values "$pomfile" /mvn:project/mvn:groupId 2>/dev/null`
+    packaging=`xml_pom_values "$pomfile" /mvn:project/mvn:packaging 2>/dev/null`
     parent_ref=`get_parent_pom_file_ref "$pomfile"`
     parent_dep=`xml_pom_parent_dep "$pomfile"`
 
-    [ "$name" ]        && echo "Name             $name"
-    [ "$groupId" ]     && echo "GroupId          $groupId"
-    [ "$artifactId" ]  && echo "ArtifactId       $artifactId"
-    [ "$version" ]     && echo "Version          $version"
+    [ "$name" ]        && echo "${c_heading}Name${c_off}             $name"
+    [ "$groupId" ]     && echo "${c_heading}GroupId${c_off}          ${c_groupid}$groupId${c_off}"
+    [ "$artifactId" ]  && echo "${c_heading}ArtifactId${c_off}       $artifactId"
+    [ "$version" ]     && echo "${c_heading}Version${c_off}          ${c_version}$version${c_off}"
+    [ "$packaging" ]   && echo "${c_heading}Packaging${c_off}        $packaging"
     if [ "$profiles" ]; then
         local profiles_string profile
         for profile in $profiles; do
             [ "$profiles_string" ] && profiles_string="$profiles_string, $profile" || profiles_string="$profile"
         done
-        echo "Profiles         $profiles_string"
+        echo "${c_heading}Profiles${c_off}         $profiles_string"
     fi
-    [ "$parent_dep" ] && echo "Parent POM       $parent_dep"
-    [ "$parent_ref" ] && echo "Parent POM path  $parent_ref"
+    [ "$parent_dep" ] && echo "${c_heading}Parent POM${c_off}       $parent_dep"
+    [ "$parent_ref" ] && echo "${c_heading}Parent POM path${c_off}  $parent_ref"
 
     echo
 }
@@ -366,7 +370,7 @@ show_pom_transitive_exclusions() {
     have_excl=`xml_pom_values "$pomfile" "/mvn:project/mvn:dependencies/mvn:dependency[mvn:exclusions]"`
     [ "$PROFILE" ] && have_excl_profile=`xml_pom_values "$pomfile" "/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:dependencies/mvn:dependency[mvn:exclusions]"`
     if [ "$have_excl" ] || [ "$have_excl_profile" ]; then
-        echo "Exclusions of transitive dependencies:"
+        echo "${c_heading}Exclusions of transitive dependencies:${c_off}"
     else
         return 1
     fi
@@ -382,7 +386,7 @@ show_pom_transitive_exclusions() {
         fi
 
         echo "  Excluded for $dep:"
-        list_elements "    " `xml_pom_get_dep_exclusions "$pomfile" "" "$predicate"`
+        list_gav_elements "    " `xml_pom_get_dep_exclusions "$pomfile" "" "$predicate"`
         echo
     done
     if [ "$have_excl_profile" ]; then
@@ -396,10 +400,25 @@ show_pom_transitive_exclusions() {
             fi
 
             echo "  Excluded for $dep:"
-            list_elements "    " `xml_pom_get_dep_exclusions "$pomfile" "$PROFILE" "$predicate"`
+            list_gav_elements "    " `xml_pom_get_dep_exclusions "$pomfile" "$PROFILE" "$predicate"`
             echo
         done
     fi
+}
+
+# Colorize variations of "GroupId:ArtifactId:Version" using simple heuristics
+colorize_gav() {
+    local IFS=: c=1 comp g= a= v=
+    for comp in $1; do
+        [ $c = 1 ] && g=$comp
+        [ $c = 2 ] && a=$comp
+        [ $c = 3 ] && v=$comp
+        c=$((c+1))
+    done
+    [ -z "$a" ] && echo "$g" && return
+    [ -z "$v" ] && [ "${a#[0-9]}" = "$a" ] && echo "${c_groupid}${g}${c_off}:${a}" && return
+    [ -z "$v" ] && [ "${a#[0-9]}" != "$a" ] && echo "${g}:${c_version}${a}${c_off}" && return
+    echo "${c_groupid}${g}${c_off}:${a}:${c_version}${v}${c_off}"
 }
 
 # List elements, possibly in two columns.
@@ -409,11 +428,10 @@ show_pom_transitive_exclusions() {
 list_elements() {
     local prefix="$1"
     shift
-    local elemcount=0 elem maxcol=0
-    for elem in "$@"; do elemcount=$((elemcount+1)); [ ${#elem} -gt $maxcol ] && maxcol=${#elem}; done
+    local elemcount=0 elem
+    for elem in "$@"; do elemcount=$((elemcount+1)); done
     [ $elemcount -eq 0 ] && return 1
-    local half=$((elemcount/2))
-    local count=0 colwidth=0
+    local half=$((elemcount/2)) count=0 colwidth=0 col2width=0
     [ $((elemcount % 2)) -eq 0 ] && count=1
     local elems_col1 elems_col2
     for elem in "$@"; do
@@ -422,6 +440,7 @@ list_elements() {
             [ ${#elem} -gt $colwidth ] && colwidth=${#elem}
         else
             elems_col2="$elems_col2${IFS}$elem"
+            [ ${#elem} -gt $col2width ] && col2width=${#elem}
         fi
         count=$((count+1))
     done
@@ -429,10 +448,8 @@ list_elements() {
 
     # Check terminal width.
     # If two colums is too wide or too few elements, fall-back to single-column output.
-    local single tw
-    tw=`tput cols`
-    single=
-    if [ $? -ne 0 ] || [ -z "$tw" ] || [ $((colwidth + maxcol + 3)) -gt $tw ] || \
+    local single= tw=`tput cols`
+    if [ $? -ne 0 ] || [ -z "$tw" ] || [ $((colwidth + col2width + 3)) -gt $tw ] || \
        [ $elemcount -le 6 ] || [ "$always_single" ]; then
         single=1
     fi
@@ -440,23 +457,41 @@ list_elements() {
     if [ "$single" ]; then
         # Single column listing
         for elem in "$@"; do
+            [ "$colorize_gav" ] && elem=`colorize_gav $elem`
             printf "%s%s\n" "$prefix" "$elem"
         done
     else
         # Two-column listing in proper order. This gets kinda quirky because plain Bourne-shell
-        # does not support arrays. So we work around that ..
-        local col1 col2 c1 c2
+        # does not support arrays. Also, we have to account for possible colorization escape
+        # sequences in length calculations.
+        local col1 col2 c1 c2 len_elem1
         c1=1
         for elem in $elems_col1; do
-            col1="$elem"
+            len_elem1=${#elem}
+            [ "$colorize_gav" ] && col1=`colorize_gav $elem` || col1="$elem"
             col2=
             c2=1
-            for elem2 in $elems_col2; do [ $c1 -eq $c2 ] && col2="$elem2" && break; c2=$((c2+1)); done
-            printf "%s%-${colwidth}s %s\n" "$prefix" "$col1" "$col2"
+            for elem2 in $elems_col2; do
+                if [ $c1 -eq $c2 ]; then
+                    [ "$colorize_gav" ] && elem2=`colorize_gav $elem2`
+                    col2="$elem2"
+                    break
+                fi
+                c2=$((c2+1))
+            done
+            printf "${prefix}${col1}"
+            printf "%-$((colwidth - len_elem1))s %s\n" '' "$col2"
             c1=$((c1+1))
         done
     fi
 }
+
+# Like `list_elements`, but with potential colorization of GAV values
+list_gav_elements() {
+    [ "$c_enabled" ] && local colorize_gav=1
+    list_elements "$@"
+}
+
 
 show_pom_distribution_management_repository() {
     local pomfile="$1" repourls repourls_profile=
@@ -465,7 +500,7 @@ show_pom_distribution_management_repository() {
     
     if [ "$repourls" ] || [ "$repourls_profile" ]; then
         local repourl
-        echo "Distribution repository URLs:"
+        echo "${c_heading}Distribution repository URLs:${c_off}"
         for repourl in $repourls $repourls_profile; do
             echo "  $repourl"
         done
@@ -482,7 +517,7 @@ list_pom_repositories() {
     [ "$PROFILE" ] && plugin_repos_profile=`xml_pom_values "$pomfile" "/mvn:project/mvn:profiles/mvn:profile[mvn:id='$PROFILE']/mvn:pluginRepositories/mvn:pluginRepository/mvn:url" | LC_ALL=C sort`
 
     if [ "$repos" ] || [ "$plugin_repos" ] || [ "$repos_profile" ] || [ "$plugin_repos_profile" ]; then
-        echo "Defined repository URLs:"
+        echo "${c_heading}Defined repository URLs:${c_off}"
     fi
 
     if [ "$repos" ] || [ "$repos_profile" ]; then
@@ -506,9 +541,9 @@ display_pom_data() {
     [ "${pomfile_abs#$HOME}" != "$pomfile_abs" ] && pomfile_abs="~${pomfile_abs#$HOME}"
 
     if [ "$2" = "parent" ]; then
-        echo "Parent POM file  $pomfile_abs"
+        echo "${c_heading}Parent POM file${c_off}  $pomfile_abs"
     else
-        echo "POM file         $pomfile_abs"
+        echo "${c_heading}POM file${c_off}         $pomfile_abs"
     fi
 
     [ -z "$show_all" ] && [ -z "$short_basic" ] && echo
@@ -522,7 +557,7 @@ display_pom_data() {
         modules=`xml_pom_get_modules "$pomfile"|LC_ALL=C sort`
         [ "$PROFILE" ] && modules_profile=`xml_pom_get_modules "$pomfile" "$PROFILE"|LC_ALL=C sort`
         if [ "$modules" ] || [ "$modules_profile" ]; then
-            echo "Modules:"
+            echo "${c_heading}Modules:${c_off}"
             list_elements "  " $modules $modules_profile
             echo
         fi
@@ -533,8 +568,8 @@ display_pom_data() {
         build_plugins=`xml_pom_get_build_plugins "$pomfile"|LC_ALL=C sort`
         [ "$PROFILE" ] && build_plugins_profile=`xml_pom_get_build_plugins "$pomfile" "$PROFILE"|LC_ALL=C sort`
         if [ "$build_plugins" ] || [ "$build_plugins_profile" ]; then
-            echo "Build plugins:"
-            list_elements "  " $build_plugins $build_plugins_profile
+            echo "${c_heading}Build plugins:${c_off}"
+            list_gav_elements "  " $build_plugins $build_plugins_profile
             echo
         fi
     fi
@@ -544,7 +579,7 @@ display_pom_data() {
         props=`xml_pom_props "$pomfile"|LC_ALL=C sort`
         [ "$PROFILE" ] && props_profile=`xml_pom_props "$pomfile" "$PROFILE"|LC_ALL=C sort`
         if [ "$props" ] || [ "$props_profile" ]; then
-            echo "Properties:"
+            echo "${c_heading}Properties:${c_off}"
             IFS='
 '
             list_elements "  " $props $props_profile
@@ -555,17 +590,33 @@ display_pom_data() {
     fi
 
     if [ "$show_all" ] || [ "$short_deps" ]; then
-        if [ "$RESOLVED_DEPS" ]; then
-            echo "All resolved dependencies:"
-            list_elements "  " $RESOLVED_DEPS
-            echo
+        if [ "$RESOLVED_DEPS" ] || [ "$RESOLVED_TEST_DEPS" ]; then
+            if [ "$RESOLVED_DEPS" ]; then
+                echo "${c_heading}Resolved dependencies:${c_off}"
+                list_gav_elements "  " $RESOLVED_DEPS
+                echo
+            fi
+            if [ "$RESOLVED_TEST_DEPS" ]; then
+                echo "${c_heading}${c_test}Resolved test dependencies:${c_off}"
+                list_gav_elements "  " $RESOLVED_TEST_DEPS
+                echo
+            fi
         else
-            local pom_deps pom_deps_profile=
-            pom_deps=`xml_pom_deps "$pomfile"|LC_ALL=C sort`
-            [ "$PROFILE" ] && pom_deps_profile=`xml_pom_deps "$pomfile" "$PROFILE"|LC_ALL=C sort`
+            local pom_deps pom_test_deps pom_deps_profile= pom_test_deps_profile=
+            pom_deps=`xml_pom_deps "$pomfile" '' "not(mvn:scope='test')"|LC_ALL=C sort`
+            pom_test_deps=`xml_pom_deps "$pomfile" '' "mvn:scope='test'"|LC_ALL=C sort`
+            if [ "$PROFILE" ]; then
+                pom_deps_profile=`xml_pom_deps "$pomfile" "$PROFILE" "not(mvn:scope='test')"|LC_ALL=C sort`
+                pom_test_deps_profile=`xml_pom_deps "$pomfile" "$PROFILE" "mvn:scope='test'"|LC_ALL=C sort`
+            fi
             if [ "$pom_deps" ] || [ "$pom_deps_profile" ]; then
-                echo "Direct dependencies:"
-                list_elements "  " $pom_deps $pom_deps_profile
+                echo "${c_heading}Direct dependencies:${c_off}"
+                list_gav_elements "  " $pom_deps $pom_deps_profile
+                echo
+            fi
+            if [ "$pom_test_deps" ] || [ "$pom_test_deps_profile" ]; then
+                echo "${c_heading}${c_test}Direct test dependencies:${c_off}"
+                list_gav_elements "  " $pom_test_deps $pom_test_deps_profile
                 echo
             fi
         fi
@@ -576,16 +627,16 @@ display_pom_data() {
 
 usage() {
     cat <<EOF
-Maven POM file inspector $VER
+Inspector Pom $VER
 This command quickly extracts and displays essential data from a Maven POM file.
-The output is compact and readable plain text.
+The output is compact and readable plain text, optionally colorized.
 
 Usage: `basename $0` [options] [pomfile/dir] [shortcut [..]]
 
-By default, the first POM file found in either the current directory
-or any parent directory is processed, and all information is displayed. If path
-to an existing directory or file is supplied, then that is used as basis for POM
-file resolving instead.
+By default, the first POM file found in either the current directory or any
+parent directory is processed, and all information is displayed. If path to an
+existing directory or file is supplied, then that is used as basis for POM file
+resolving instead.
 
 If the POM file directly refers to a parent POM by path, the parent POM is also
 processed and displayed.
@@ -594,14 +645,17 @@ Shortcuts can be used to filter the types of information displayed about the POM
 file.
 
 Options:
--1, --single       Always use single-column listings.
--P, --profile <id> Show data for given POM profile.
-                   This will not show global data common to all profiles.
--E, --effective    Invoke Maven to generate effective POM and display that instead.
--R, --resolve      Invoke Maven to resolve all regular dependencies before display.
--N, --noparents    Avoid traversing parent POM files with local path reference.
--v, --version      Show version of this utility.
--h, --help         Show this help.
+-r      Invoke Maven to resolve all regular dependencies before display.
+-e      Invoke Maven to generate effective POM and display that instead.
+        Can be combined with '-r' to show both all resolved transitive 
+        dependencies and the effective POM.
+-P <id> Show data for given POM profile.
+        This will typically not show global data common to all profiles.
+-n      Avoid traversing parent POM files with local path reference.
+-1      Always use single-column listings.
+-c      Enable experimental colorized output.
+-h      Show this help.
+-v      Show version of this utility.
 
 Shortcuts/filters:
 ba[sic]        Show basic project info.
@@ -611,9 +665,32 @@ pl[ugins]      Show build plugins.
 de[ps]         Show direct dependencies.
 ex[clusions]   Show transitive exclusions for direct dependencies.
 pr[ops]        Show properties.
-all            Show everything (DEFAULT).
+mo[dules]      Show modules.
+all            Show everything (default).
 EOF
     exit 0
+}
+
+c_off=
+c_heading=
+c_version=
+c_groupid=
+c_test=
+c_enabled=
+enable_color() {
+    [ -t 1 ] || return
+    local bright='[01m'
+    local reset='[0m'
+    local yellow='[93m'
+    local blue='[34m'
+    local green='[32m'
+    local gray='[37m'
+    c_off=$reset
+    c_heading=$bright
+    c_version=$yellow
+    c_groupid=$gray
+    c_test=$green
+    c_enabled=1
 }
 
 pomfile=
@@ -631,55 +708,49 @@ profile=
 effective_pom=
 resolve_deps=
 follow_parent_poms=1
-while [ "$1" ]; do
-    if [ -f "$1" ] || [ -d "$1" ]; then
-        pomfile="$1"; shift; continue
-    fi
-    
-    case "$1" in
-        -h|--help|-\?|-H) usage ;;
-        -v|--version) echo "pom v$VER"; exit 0 ;;
-        -1|--single) always_single=1 ;;
-        -E|--effective)
-            effective_pom=1
-            ;;
-        -N|--noparents)
-            follow_parent_poms=
-            ;;
-        -R|--resolve)
-            resolve_deps=1
-            ;;
-            
-        -P*|--profile)
-            if [ "$1" != "--profile" ] && [ "${1#-P}" ]; then
-                profile="${1#-P}"
-            else
-                shift
-                profile="$1"
-            fi
-            if [ "${profile#*,}" != "$profile" ] || [ "${profile%,*}" != "$profile" ]; then
-                echo "Error: can only show info for a single profile at a time: $profile"
-                exit 1
-            fi
-            ;;
-        
-        ba*) short_basic=1; show_all= ;;
-        re*) short_repos=1; show_all= ;;
-        di*) short_dist=1; show_all=  ;;
-        pl*) short_plugs=1; show_all= ;;
-        de*) short_deps=1; show_all=  ;;
-        ex*) short_trex=1; show_all=  ;;
-        pr*) short_props=1; show_all= ;;
-        mo*) short_modules=1; show_all= ;;
-        all) show_all=1 ;;
-        
-        *)
-            echo "Error: unknown option/shortcut or non-existing file/dir: $1, see --help."; exit 1 ;;
-    esac
-    shift
-done
 
-type xsltproc 1>/dev/null 2>&1 || { echo "Error: missing required command: xsltproc"; exit 255; }
+while [ "$1" ]; do
+    while getopts ":hv1enrcP:" option; do
+        case $option in
+            h) usage ;;
+            v) echo "Inspector Pom v$VER"; exit 0 ;;
+            1) always_single=1 ;;
+            e) effective_pom=1 ;;
+            n) follow_parent_poms= ;;
+            r) resolve_deps=1 ;;
+            c) enable_color ;;
+            P) profile=$OPTARG ;;
+            ?) echo >&2 "Error: unknown option: $OPTARG"; exit 1 ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    if [ "$1" ]; then
+        if [ -f "$1" ] || [ -d "$1" ]; then
+            pomfile="$1"
+        else
+            case $1 in
+                ba*) short_basic=1; show_all= ;;
+                re*) short_repos=1; show_all= ;;
+                di*) short_dist=1; show_all=  ;;
+                pl*) short_plugs=1; show_all= ;;
+                de*) short_deps=1; show_all=  ;;
+                ex*) short_trex=1; show_all=  ;;
+                pr*) short_props=1; show_all= ;;
+                mo*) short_modules=1; show_all= ;;
+                all) show_all=1 ;;
+                *) echo >&2 "Error: unknown shortcut or non-existing file/dir: $1, see --help."; exit 1 ;;
+            esac
+        fi
+    fi
+    [ $# -gt 0 ] && shift
+    OPTIND=1
+done
+if [ "${profile#*,}" != "$profile" ] || [ "${profile%,*}" != "$profile" ]; then
+    echo >&2 "Error: only a single profile can be selected at a time: $profile"
+    exit 1
+fi
+
+type xsltproc 1>/dev/null 2>&1 || { echo >&2 "Error: missing required command: xsltproc"; exit 255; }
 
 # Resolve actual pom.xml file to work with:
 if [ -z "$pomfile" ] || [ -d "$pomfile" ]; then
@@ -696,18 +767,18 @@ if [ -z "$pomfile" ] || [ -d "$pomfile" ]; then
     pomfile="$dir/pom.xml"
 
     if ! [ -f "$pomfile" ]; then
-        echo "Error: no pom.xml file found in base or any parent directory."
+        echo >&2 "Error: no pom.xml file found in base or any parent directory."
         exit 1
     fi
 elif ! [ -f "$pomfile" ]; then
-    echo "Error: POM file $pomfile not found."
+    echo >&2 "Error: POM file $pomfile not found."
     exit 1
 fi
 
 PROFILE=
 if [ "$profile" ]; then
     found=
-    for p in $(xml_pom_values "$pomfile" /mvn:project/mvn:profiles/mvn:profile/mvn:id 2>/dev/null); do
+    for p in `xml_pom_values "$pomfile" /mvn:project/mvn:profiles/mvn:profile/mvn:id 2>/dev/null`; do
         if [ "$p" = "$profile" ]; then
             found=1
             break
@@ -715,36 +786,37 @@ if [ "$profile" ]; then
     done
 
     if [ -z "$found" ]; then
-        echo "Error: profile with id '$profile' not found in POM file"
+        echo >&2 "Error: profile with id '$profile' not found in POM file"
         exit 1
     fi
 
     PROFILE=$profile
 fi
 
-RESOLVED_DEPS=
+RESOLVED_DEPS= RESOLVED_TEST_DEPS=
 if [ "$resolve_deps" ]; then
     echo "Invoking Maven to resolve dependencies .." >&2
-    RESOLVED_DEPS=$(mvn_resolve_dependencies "$pomfile" "$PROFILE")
+    resolved=`mvn_resolve_dependencies "$pomfile" "$PROFILE"`
     if [ $? -ne 0 ]; then
-        echo "Error: Maven failed to resolve dependencies for file $pomfile"
+        echo >&2 "Error: Maven failed to resolve dependencies for file $pomfile"
         exit 1
     fi
+    RESOLVED_TEST_DEPS=`echo "$resolved"|sed -En 's/:test$//p'`
+    RESOLVED_DEPS=`echo "$resolved"|sed -En 's/:(compile|runtime|provided|system)$//p'`
 fi
     
-
 if [ "$effective_pom" ]; then
     echo "Invoking Maven to generate effective POM .." >&2
-    tmp_pomfile=$(mvn_generate_effective_pom "$pomfile" "$PROFILE")
+    tmp_pomfile=`mvn_generate_effective_pom "$pomfile" "$PROFILE"`
     if [ $? -ne 0 ]; then
-        echo "Error: Maven failed to generate effective POM for file $pomfile"
+        echo >&2 "Error: Maven failed to generate effective POM for file $pomfile"
         exit 1
     fi
     PROFILE= # selected profile is factored into global POM parts by Maven.
 
     # Effective POM file may contain multiple projects, split into several files
-    for tmp_project_pomfile in $(xml_split_projects "$tmp_pomfile"); do
-        echo ------------------------
+    for tmp_project_pomfile in `xml_split_projects "$tmp_pomfile"`; do
+        echo
         echo
         display_pom_data "$tmp_project_pomfile"
         rm -f "$tmp_project_pomfile"
@@ -765,7 +837,7 @@ else
                 parent=parent
                 continue
             else
-                echo "Warning: invalid parent POM reference detected: '$parent_ref' (not found)."
+                echo >&2 "Warning: invalid parent POM reference detected: '$parent_ref' (not found)."
             fi
         fi
         pomfile=
