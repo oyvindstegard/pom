@@ -34,6 +34,7 @@ incredibly useful.
     cd pom
     chmod +x pom
     cp pom <to somewhere in your PATH>
+    sudo apt install xsltproc  # on Debian-like Linux
 
 
 ## Usage examples
