@@ -1,4 +1,4 @@
-# Inspector Pom - a command line Maven pom.xml inspector tool
+# Inspector Pom - a command line Maven pom.xml inspection tool
 
 > Because nobody likes to squint at oodles of XML just to check a version
 > number.
@@ -34,7 +34,7 @@ incredibly useful.
     cd pom
     chmod +x pom
     cp pom <to somewhere in your PATH>
-    sudo apt install xsltproc  # on Debian-like Linux
+    sudo apt install xsltproc  # .. on Debian-like Linux
 
 
 ## Usage examples
