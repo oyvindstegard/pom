@@ -36,7 +36,7 @@ incredibly useful.
     cp pom <to somewhere in your PATH>
 
 
-## Examples
+## Usage examples
 
 Simply invoke `pom` in a project root directory or any subdir, and it searches
 for the nearest `pom.xml` file (upwards) and displays essential data as nicely
@@ -270,6 +270,17 @@ Properties:
 Combine `pom` with `grep` for very exact extractions of information. (And let
 Inspector Pom worry about parsing the XML, which can be a pain to grep
 directly.)
+
+### Colorized output
+
+There is experimental support for colorized output to improve readability. This
+deemphasizes group-ids and highlights version numbers and section headings. Use
+option `-c` to enable.
+
+To always use colorized output, add this to `~/.bashrc` or similar:
+
+    alias pom='pom -c'
+
 
 ## Command help
 
