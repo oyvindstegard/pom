@@ -328,7 +328,7 @@ mvn_resolve_dependencies() {
     mvn -q -B -f "$pomfile" ${profile:+-P$profile} -DoutputFile="$tmpfile" -Dsilent=true dependency:list
     exitcode=$?
     if [ $exitcode -eq 0 ]; then
-        awk -F: '/:(compile|provided|runtime|test|system)$/ {gsub(/[ \t]/,"");printf("%s:%s:%s:%s\n",$1,$2,$4,$5);}' < "$tmpfile" | LC_ALL=C sort
+        sed -En 's/ *([^:]+):([^:]+):[^:]+:([^:]+):(compile|provided|runtime|test|system).*/\1:\2:\3:\4/p' < "$tmpfile" | LC_ALL=C sort
     fi
     rm -f "$tmpfile"
     [ $exitcode -eq 0 ]
