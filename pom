@@ -25,6 +25,9 @@
 ################################################################################
 #
 #                                  Changelog
+# 0.9.1
+#   * Fixes compatibility bug with projects building for Java > 11.
+#
 # 0.9
 #   * Add support for displaying modules and multi-project effective POMs.
 #   * Add support for experimental colorization of output, specifically artifacts.
@@ -56,7 +59,7 @@
 #
 ################################################################################
 
-readonly VER=0.9
+readonly VER=0.9.1
 
 xml_pom_values() {
     local pomfile xpath
